@@ -34,11 +34,13 @@ pub const INTERFERENCE_DOC: &str = "study: id|name; occurrences?: [ids or names]
      depth_mm (how far into each other, the most at deepest_step), volume_mm3 (their overlap there; null when it was not \
      cheap to work out)}], clear, \
      pairs (checked), samples (taken), truncated (the work budget ran out; checked_to: the last step checked), stopped_at, \
-     stopped_by_loop; static_overlaps: [{a, b, depth_mm}] (pairs that overlap at the first sample and keep their placement \
+     stopped_by_loop; static_overlaps: [{a, b, depth_mm, volume_mm3}] (pairs that overlap at the first sample and keep their placement \
      to each other all through it, such as a pin pressed into its block or a thread in its tapped hole: no motion of the study \
      changes them, so they are not collisions and do not make it unclear; inspect.clearance measures them; only when every sample \
      was checked: a check that stopped early keeps them in collisions), pairs_moving_together \
-     (pairs that keep their placement to each other: each is tested once). The study plays as motion.play plays it but contact sets do not stop it, on a copy (the design is not \
+     (pairs that keep their placement to each other: each is tested once); mesh_contacts: [{a, b, depth_mm}] (pairs the meshes \
+     found no deeper into each other than their chord tolerance, such as a pin turning in its bore at a small clearance or a bearing seated line to line, and \
+     the exact check where they went deepest found them sharing less than 0.01 mm³: not collisions). The study plays as motion.play plays it but contact sets do not stop it, on a copy (the design is not \
      changed). Parts are tested at the samples only: one that passes wholly through another between two samples is missed";
 
 /// Most samples a plot or an interference check takes: each is a solve.
@@ -49,6 +51,9 @@ const MAX_SERIES: usize = 256;
 const MAX_WORK: usize = 500_000_000;
 /// Most colliding pairs whose overlap volume is worked out, and most body booleans that takes.
 const MAX_VOLUMES: usize = 16;
+/// Less shared than this (mm³) is contact, not overlap: inspect.clearance's default min_volume.
+/// Fixed, not scaled with the design: a large assembly's real overlaps stay collisions.
+const CONTACT_MM3: f64 = 0.01;
 const MAX_BOOLEANS: usize = 64;
 
 /// How many samples `p` asks for (`min`…`MAX_SAMPLES`, default the study's steps + 1).
@@ -294,6 +299,12 @@ fn shared_volume(s: &Session, doc: &Document, a: u64, b: u64, booleans: &mut usi
             }
             *booleans = booleans.checked_sub(1)?;
             let (pa, pb) = (solidcraft_kernel::transform_matrix(&ba.body, *fa).ok()?, solidcraft_kernel::transform_matrix(&bb.body, *fb).ok()?);
+            // A pin a hair off the axis of its bore: the crescent the walls share, which the
+            // boolean can't intersect.
+            if let Some(o) = solidcraft_kernel::coaxial_overlap(&pa, &pb) {
+                total += o.volume;
+                continue;
+            }
             if let Some(shared) = solidcraft_kernel::boolean(&pa, &pb, solidcraft_kernel::BoolOp::Intersect).ok()? {
                 total += solidcraft_kernel::measure(&shared).ok()?.volume;
             }
@@ -428,16 +439,33 @@ pub(super) fn interference(s: &mut Session, p: &Value) -> Result<Value> {
     let together = geometry.member_pairs().difference(&moved).count();
     let whole = !truncated && checked == n;
     let fixed: Vec<(u64, u64)> = if whole { found.keys().filter(|k| !moved.contains(k)).copied().collect() } else { Vec::new() };
-    let static_overlaps: Vec<Value> =
-        fixed.iter().filter_map(|k| found.remove(k)).map(|c| json!({"a": c.names.0, "b": c.names.1, "depth_mm": c.depth})).collect();
+    // A hit no deeper than the meshes can be off (a pin turning in its bore at a small clearance,
+    // a bearing seated line to line in its housing: the bore meshed inside its surface) is checked
+    // exactly where it went deepest: with nothing shared there, it is a contact of the meshes, not
+    // a collision or a static overlap.
+    let mut booleans = MAX_BOOLEANS;
+    let slack = 2.0 * geometry.chord();
+    let volumes: BTreeMap<(u64, u64), Option<f64>> =
+        found.iter().filter(|(_, c)| c.depth <= slack).map(|(k, c)| (*k, shared_volume(s, &c.at_deepest, k.0, k.1, &mut booleans))).collect();
+    let mesh_only: Vec<(u64, u64)> = volumes.iter().filter(|(_, v)| v.is_some_and(|v| v < CONTACT_MM3)).map(|(k, _)| *k).collect();
+    let mesh_contacts: Vec<Value> =
+        mesh_only.iter().filter_map(|k| found.remove(k)).map(|c| json!({"a": c.names.0, "b": c.names.1, "depth_mm": c.depth})).collect();
+    let static_overlaps: Vec<Value> = fixed
+        .iter()
+        .filter_map(|k| found.remove(k).map(|c| (k, c)))
+        .map(|(k, c)| json!({"a": c.names.0, "b": c.names.1, "depth_mm": c.depth, "volume_mm3": volumes.get(k).copied().flatten()}))
+        .collect();
     let mut list: Vec<(&(u64, u64), &Collision)> = found.iter().collect();
     list.sort_by_key(|(_, c)| c.samples.first().copied().unwrap_or(usize::MAX));
-    let mut booleans = MAX_BOOLEANS;
     let collisions: Vec<Value> = list
         .iter()
         .enumerate()
         .map(|(i, ((a, b), c))| {
-            let volume = if i < MAX_VOLUMES { shared_volume(s, &c.at_deepest, *a, *b, &mut booleans) } else { None };
+            let volume = match volumes.get(&(*a, *b)) {
+                Some(v) => *v,
+                None if i < MAX_VOLUMES => shared_volume(s, &c.at_deepest, *a, *b, &mut booleans),
+                None => None,
+            };
             let first = c.samples.first().map(|k| step_of(&m, *k, n));
             let last = c.samples.last().map(|k| step_of(&m, *k, n));
             json!({"a": c.names.0, "b": c.names.1, "first_step": first, "last_step": last, "steps": ranges(&m, &c.samples, n),
@@ -445,7 +473,7 @@ pub(super) fn interference(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .collect();
     let mut out = json!({"study": m.name, "steps": m.steps, "clear": collisions.is_empty(), "collisions": collisions,
-        "static_overlaps": static_overlaps, "pairs": geometry.pair_count(), "pairs_moving_together": together, "samples": checked,
+        "static_overlaps": static_overlaps, "mesh_contacts": mesh_contacts, "pairs": geometry.pair_count(), "pairs_moving_together": together, "samples": checked,
         "truncated": truncated});
     if truncated {
         out["checked_to"] = json!(checked.checked_sub(1).map(|k| step_of(&m, k, n)));
